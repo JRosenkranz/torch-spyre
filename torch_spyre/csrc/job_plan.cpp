@@ -70,8 +70,13 @@ std::unique_ptr<flex::RuntimeOperation> JobPlanStepCompute::construct(
       tensor_allocs.push_back(address);
     }
   }
+  // DBG2633X: forward the full program-segment footprint (JobPlan Allocate size) so flex bounds the
+  // seg-7 xlat length to it instead of the 16GB SEGMENT_SIZE. Pass an explicit empty tensor_byte_offsets
+  // so the trailing prog_footprint_size arg lines up with the new ctor signature.
+  std::cerr << "DBG2633X CONSTRUCT prog_footprint_size_=" << prog_footprint_size_ << std::endl;  // DBG2633X
   auto op = std::make_unique<flex::RuntimeOperationCompute>(
-      &binary_address_, tensor_allocs, "", bootstrap_addr_);
+      &binary_address_, tensor_allocs, "", bootstrap_addr_, std::vector<uint64_t>{},
+      prog_footprint_size_);  // DBG2633X
   op->setPipelineBarrier(pipeline_barrier_);
   return op;
 }

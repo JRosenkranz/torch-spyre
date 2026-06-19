@@ -348,10 +348,12 @@ class JobPlanStepCompute final : public JobPlanStep {
    */
   explicit JobPlanStepCompute(flex::CompositeAddress binary_address,
                               bool bind_io_addresses,
-                              uint64_t bootstrap_addr = flex::PROG_OFFSET_BASE)
+                              uint64_t bootstrap_addr = flex::PROG_OFFSET_BASE,
+                              uint64_t prog_footprint_size = 0)  // DBG2633X: full Allocate footprint
       : binary_address_(std::move(binary_address)),
         bind_io_addresses_(bind_io_addresses),
-        bootstrap_addr_(bootstrap_addr) {}
+        bootstrap_addr_(bootstrap_addr),
+        prog_footprint_size_(prog_footprint_size) {}  // DBG2633X
 
   std::unique_ptr<flex::RuntimeOperation> construct(
       LaunchContext& ctx) const override;
@@ -362,6 +364,7 @@ class JobPlanStepCompute final : public JobPlanStep {
   flex::CompositeAddress binary_address_;
   bool bind_io_addresses_;
   uint64_t bootstrap_addr_;
+  uint64_t prog_footprint_size_ = 0;  // DBG2633X: full JobPlan Allocate size (program-segment footprint)
 };
 
 /**

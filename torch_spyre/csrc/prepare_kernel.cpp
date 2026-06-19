@@ -277,9 +277,15 @@ std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnDevice(
   TORCH_CHECK(job_bin_addr.total_size() > 0,
               "ComputeOnDevice binary address must be populated (size > 0)");
 
-  // Create RuntimeOperationCompute with the allocated program address
-  return std::make_unique<JobPlanStepCompute>(std::move(job_bin_addr),
-                                              bind_io_addresses_, job_bin_ptr);
+  // Create RuntimeOperationCompute with the allocated program address.
+  // DBG2633X: pass the FULL program-segment footprint (binary + correction + spillover) = the JobPlan
+  // Allocate size, so flex can bound the seg-7 xlat length to it instead of the 16GB SEGMENT_SIZE.
+  // job_bin_addr (the binary suffix) only carries total_size - boot_off, which is too small.
+  std::cerr << "DBG2633X STEP-BUILD job_allocation total_size=" << job_allocation_.value().total_size()  // DBG2633X
+            << " job_bin_ptr=0x" << std::hex << job_bin_ptr << std::dec << std::endl;  // DBG2633X
+  return std::make_unique<JobPlanStepCompute>(
+      std::move(job_bin_addr), bind_io_addresses_, job_bin_ptr,
+      /*prog_footprint_size=*/job_allocation_.value().total_size());  // DBG2633X
 }
 
 std::unique_ptr<JobPlanStep> JobPlanBuilder::translateComputeOnHost(

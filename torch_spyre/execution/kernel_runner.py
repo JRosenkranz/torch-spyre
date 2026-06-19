@@ -42,6 +42,12 @@ class SpyreSDSCKernelRunner:
 
     def run(self, *args, **kw_args):
         logger.info("RUN: %s %s", self.kernel_name, self.code_dir)
+        import sys as _sys  # DBG2633: attribute kernel exec to live test
+        _sys.stderr.write(  # DBG2633
+            f"=== DBG2633 KERNEL-RUN code_dir={self.code_dir} "  # DBG2633
+            f"jobplan={'1' if self.jobplan else '0'} ===\n"  # DBG2633
+        )  # DBG2633
+        _sys.stderr.flush()  # DBG2633
 
         with torch.profiler.record_function(f"launch_kernel:{self.kernel_name}"):
             if self.jobplan:
