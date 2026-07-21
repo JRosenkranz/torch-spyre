@@ -1379,8 +1379,20 @@ def propagate_spyre_tensor_layouts(
                     # Exclude the running accumulator itself (dep.name == target_name)
                     # from the layout constraint: it IS the output, not a new input.
                     new_value_args = [a for a in all_args if a.dep.name != target_name]
-                    if not new_value_args:
-                        # No real inputs — fall back to unconstrained candidates.
+                    # A coarse_tile Case-1 copy op (identity scatter into a full
+                    # accumulator buffer consumed OUTSIDE the loop) must NOT let its
+                    # tiled input dictate the full buffer's layout: doing so commits
+                    # the full buffer to the tile's (e.g. H-stick) layout, which
+                    # disagrees with the standard (D-stick) layout its outside
+                    # consumers read — the producer/consumer layout mismatch behind
+                    # the #3145 flash miscompile.  Instead offer the full buffer's own
+                    # standard stick candidates and let AllSameNode restickify the
+                    # copy's input to match, so writer and reader agree.
+                    if not new_value_args or op.get_name().startswith(
+                        "coarse_tile_copy"
+                    ):
+                        # No real inputs, or a coarse_tile copy — pin the full buffer
+                        # to its own standard candidates; restickify inputs to match.
                         candidates = _all_constant_layouts(target_buf)
                         target_buf.layouts = candidates
                         op.layouts = candidates
