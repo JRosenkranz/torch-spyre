@@ -77,30 +77,29 @@ void set_downcast_warn_enabled(bool enabled) {
   g_downcast_warn_enabled.store(enabled, std::memory_order_relaxed);
 }
 
-// SPYRE_HAZARD_TRACKER latch: when on (default), torch-spyre splits the
-// correction triple across S_prep/S_dev while flex's per-region hazard tracker
-// inserts the cross-stream RAW/WAR events dynamically at enqueue -- torch-spyre
-// emits no cross-stream event steps of its own. SPYRE_HAZARD_TRACKER=0 keeps
-// every step on S_dev: the single-stream floor, byte-identical to the
-// pre-overlap path (the STATIC event-step path was retired). Read once from the
-// env in init_from_env; latched into each torch-spyre-managed stream's
-// track_hazards at creation (see spyre_stream.cpp). Nothing is applied to the
-// flex RuntimeContext at _startRuntime.
-std::atomic<bool> g_hazard_tracker_enabled{true};  // default ON (HAZARD)
+// SPYRE_HAZARD_TRACKER: on = split the correction triple across S_prep/S_dev
+// and let flex insert the cross-stream H2D->Compute edge. off = single-stream
+// floor (all on S_dev; FIFO enforces the edge). Default OFF to match flex: if
+// we split but flex isn't tracking, nothing enforces H2D->Compute and results
+// go wrong. Read once in init_from_env; latched into each stream's
+// track_hazards.
+std::atomic<bool> g_hazard_tracker_enabled{
+    false};  // default OFF (matches flex)
 
 bool get_hazard_tracker_enabled() {
   return g_hazard_tracker_enabled.load(std::memory_order_relaxed);
 }
 
 void set_hazard_tracker_enabled(bool enabled) {
-  // Global source of truth for whether torch-spyre registers its own streams with
-  // flex's per-region hazard tracker. Registration happens at stream CREATION (via the
-  // track_hazards flag threaded into RuntimeContext::createStream), so flipping this
-  // after a stream is created affects only streams created afterward. In particular
-  // the default stream is fixed at RuntimeContext construction, so flipping this on
-  // after startup will NOT register the already-created default stream (a
-  // post-startup off->on flip is only partial). This is a TEST/tuning hook; the
-  // production value is latched from SPYRE_HAZARD_TRACKER in init_from_env before any
+  // Global source of truth for whether torch-spyre registers its own streams
+  // with flex's per-region hazard tracker. Registration happens at stream
+  // CREATION (via the track_hazards flag threaded into
+  // RuntimeContext::createStream), so flipping this after a stream is created
+  // affects only streams created afterward. In particular the default stream is
+  // fixed at RuntimeContext construction, so flipping this on after startup
+  // will NOT register the already-created default stream (a post-startup
+  // off->on flip is only partial). This is a TEST/tuning hook; the production
+  // value is latched from SPYRE_HAZARD_TRACKER in init_from_env before any
   // stream is created.
   g_hazard_tracker_enabled.store(enabled, std::memory_order_relaxed);
 }
@@ -115,9 +114,8 @@ static void init_from_env() {
     g_downcast_warn_enabled.store(enable, std::memory_order_relaxed);
   }
   // SPYRE_HAZARD_TRACKER is a correctness gate: strict "1" semantics, NOT the
-  // permissive downcast parser above. The atomic defaults ON, so leaving the
-  // env UNSET selects HAZARD; setting it to any value other than "1" (e.g. "0")
-  // selects the single-stream floor (all steps on S_dev, no overlap).
+  // permissive downcast parser above. The atomic defaults OFF, so leaving the
+  // env UNSET selects the single-stream floor; only "1" enables the split.
   if (const char* v = std::getenv("SPYRE_HAZARD_TRACKER")) {
     g_hazard_tracker_enabled.store(std::string(v) == "1",
                                    std::memory_order_relaxed);
@@ -161,10 +159,11 @@ void _startRuntime() {
   init_from_env();
   if (runtime) {
     GlobalRuntime::set(runtime);
-    // The SPYRE_HAZARD_TRACKER latch (read in init_from_env above) is applied at stream
-    // creation: each torch-spyre-managed stream is created with track_hazards =
-    // get_hazard_tracker_enabled() (see spyre_stream.cpp), so flex registers exactly the
-    // streams torch-spyre owns. Nothing to toggle on the runtime here.
+    // The SPYRE_HAZARD_TRACKER latch (read in init_from_env above) is applied
+    // at stream creation: each torch-spyre-managed stream is created with
+    // track_hazards = get_hazard_tracker_enabled() (see spyre_stream.cpp), so
+    // flex registers exactly the streams torch-spyre owns. Nothing to toggle on
+    // the runtime here.
     DEBUGINFO(s);
     DEBUGINFO("runtime started with logical_device_id ", logical_device_id);
   } else {
@@ -582,6 +581,29 @@ PYBIND11_MODULE(_C, m) {
                " pinned_buffers=" + std::to_string(plan.pinned_buffers.size()) +
                ">";
       });
+  // Symbolic argument payload types
+  py::enum_<spyre::SymbolicArgKind>(m, "SymbolicArgKind")
+      .value("kAddress", spyre::SymbolicArgKind::kAddress)
+      .value("kDimension", spyre::SymbolicArgKind::kDimension);
+
+  py::class_<spyre::SymbolicArg>(m, "SymbolicArg")
+      .def(py::init([](spyre::SymbolicArgKind kind, int64_t tensor_id,
+                       int64_t dim_index, int64_t value) {
+             return spyre::SymbolicArg{kind, tensor_id, dim_index, value};
+           }),
+           py::arg("kind"), py::arg("tensor_id"),
+           py::arg("dim_index") = int64_t{-1}, py::arg("value") = int64_t{-1})
+      .def_readwrite("kind", &spyre::SymbolicArg::kind)
+      .def_readwrite("value", &spyre::SymbolicArg::value)
+      .def_readwrite("tensor_id", &spyre::SymbolicArg::tensor_id)
+      .def_readwrite("dim_index", &spyre::SymbolicArg::dim_index)
+      .def("__repr__", [](const spyre::SymbolicArg& a) {
+        return "<SymbolicArg kind=" +
+               std::to_string(static_cast<int32_t>(a.kind)) +
+               " tensor_id=" + std::to_string(a.tensor_id) +
+               " dim_index=" + std::to_string(a.dim_index) + ">";
+      });
+
   m.def("prepare_kernel", &spyre::prepareKernel, py::arg("spyrecode_dir"),
         py::arg("stream") = nullptr, py::arg("profiler_name") = std::nullopt,
         "Prepare a kernel from a SpyreCode directory and return a JobPlan.\n\n"
@@ -595,15 +617,35 @@ PYBIND11_MODULE(_C, m) {
         "Returns:\n"
         "    Prepared JobPlan ready for execution");
   // Bind the current-stream overload (resolves the current stream internally).
-  m.def("launch_jobplan",
-        static_cast<void (*)(const spyre::JobPlan&,
-                             const std::vector<at::Tensor>&)>(
-            &spyre::launchJobPlan),
-        py::arg("job_plan"), py::arg("args"),
-        "Launch a prepared JobPlan with the given tensor arguments.\n\n"
-        "Args:\n"
-        "    job_plan: The JobPlan to execute\n"
-        "    args: Sequence of input/output tensors");
+  // Without symbolic_args (back-compat, empty payload → legacy address loop).
+  m.def(
+      "launch_jobplan",
+      static_cast<void (*)(  // NOLINT(whitespace/parens)
+          const spyre::JobPlan&, const std::vector<at::Tensor>&,
+          std::vector<spyre::SymbolicArg>)>(&spyre::launchJobPlan),
+      py::arg("job_plan"), py::arg("args"),
+      py::arg("symbolic_args") = std::vector<spyre::SymbolicArg>{},
+      "Launch a prepared JobPlan with the given tensor arguments.\n\n"
+      "Args:\n"
+      "    job_plan: The JobPlan to execute\n"
+      "    args: Sequence of input/output tensors\n"
+      "    symbolic_args: Optional typed per-symbol payload. When non-empty,\n"
+      "        JobPlanStepHostCompute resolves each correction slot by kind\n"
+      "        rather than blindly iterating tensors. Empty (default)\n"
+      "        preserves today's legacy behavior.");
+
+  // Test-only seam: exposes JobPlanStepHostCompute::resolveSymbolicArgs so
+  // that Python tests can assert on the ordered int64 vector that would be
+  // handed to deeptools, without needing a live HCM or device execution.
+  // The "_" prefix signals this is not part of the stable public API.
+  m.def("_resolve_symbolic_args",
+        &spyre::JobPlanStepHostCompute::resolveSymbolicArgs, py::arg("tensors"),
+        py::arg("symbolic_args"),
+        "Test-only: resolve a symbolic_args payload to a list of int64 DMVA "
+        "addresses.\n\n"
+        "Calls JobPlanStepHostCompute::resolveSymbolicArgs — the same function "
+        "used by the typed-payload resolution path at launch time — so the "
+        "result is identical to what would be passed to deeptools.");
 
   // ── Two-stream overlap: step-ordering validator + test hooks ──
 
