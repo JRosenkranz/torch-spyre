@@ -30,6 +30,11 @@
 
 namespace spyre {
 
+void retainOperationOwners(flex::Runtime_operation_cb_t& callback,
+                           std::vector<std::shared_ptr<const void>> owners);
+void reapOperationOwners();
+void synchronizePrepStreams(c10::Device device);
+
 class SpyreStream {
  private:
   c10::Stream stream_;
@@ -48,8 +53,11 @@ class SpyreStream {
   void synchronize() const;  // Block until work done
 
   void copyAsync(const at::Tensor& src, const at::Tensor& dst) const;
-  void copyProgramAsync(void* prog_cpu_ptr,
-                        const flex::CompositeAddress* device_address) const;
+  bool tryInitializationCopy(const at::Tensor& src,
+                              const at::Tensor& dst) const;
+  void copyProgramAsync(
+      void* prog_cpu_ptr, const flex::CompositeAddress* device_address,
+      std::vector<std::shared_ptr<const void>> owners = {}) const;
 
   void launch(const JobPlan& plan, const std::vector<at::Tensor>& args,
               std::vector<SymbolicArg> symbolic_args = {}) const;
@@ -65,7 +73,8 @@ class SpyreStream {
   // flex::RuntimeStream::fillAsync overload, which performs the value->pattern
   // conversion internally (no FillParams construction here).
   void fillAsync(const flex::CompositeAddress* dst, double value,
-                 DataFormats dtype, bool use_dmai) const;
+                 DataFormats dtype, bool use_dmai,
+                 std::shared_ptr<const void> owner) const;
   // Host-side compute for deeptools host compute calls.
   void launchHostCompute(flex::HostComputeParams*) const;
 
@@ -78,9 +87,10 @@ class SpyreStream {
 
  private:
   flex::RuntimeStream* resolveRuntimeHandle() const;
-  void copyAsyncImpl(void* cpu_ptr,
-                     const flex::CompositeAddress* device_address,
-                     const DataConversionInfo* dci, bool host2device) const;
+  void copyAsyncImpl(
+      void* cpu_ptr, const flex::CompositeAddress* device_address,
+      const DataConversionInfo* dci, bool host2device,
+      std::vector<std::shared_ptr<const void>> owners = {}) const;
 };
 
 /**

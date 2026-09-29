@@ -24,10 +24,12 @@
 #include <utility>
 #include <vector>
 
+#include "comm_stream.h"
 #include "logging.h"
 #include "module.h"
 #include "spyre_allocator.h"
 #include "spyre_composite_address.h"
+#include "spyre_gil.h"
 #include "spyre_stream.h"
 #include "types_mapping.h"
 
@@ -44,10 +46,11 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
 
   /*
    * Start the communication library
-   * Pass it the shared runtime library handle, and default stream.
+   * Pass it the shared runtime and the selected default or opt-in Comm stream.
    */
   spyre_comms::initialize_library(spyre::GlobalRuntime::get(),
-                                  spyre::getDefaultStreamRuntimeHandle());
+                                  spyre::get_comms_stream());
+  spyre::check_comms_stream();
   group_context_ = spyre_comms::get_world_context();
   if (nullptr == group_context_) {
     std::string _err_msg =
@@ -57,7 +60,16 @@ SpyreCCLBackend::SpyreCCLBackend(const c10::intrusive_ptr<::c10d::Store>& store,
 }
 
 SpyreCCLBackend::~SpyreCCLBackend() {
-  spyre_comms::finalize_library();
+  spyre::ReleaseGilIfHeld release;
+  if (!spyre::drain_comms_for_finalize()) return;
+  try {
+    spyre_comms::finalize_library();
+  }
+  catch (...) {
+    // Destructors cannot surface runtime errors. Preserve the first error and
+    // all quarantined ownership instead of finalizing an active failed stream.
+    spyre::record_comm_stream_failure(std::current_exception());
+  }
 }
 
 /* **********************************************
@@ -419,6 +431,7 @@ void SpyreCCLBackend::check_vector_tensor(
 c10::intrusive_ptr<Work> SpyreCCLBackend::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const AllgatherOptions& opts) {
+  spyre::guard_legacy_collective();
   if (static_cast<int>(outputTensors.size()) != 1) {
     std::string _err_msg =
         "[" + getBackendName() +
@@ -468,6 +481,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::_allgather_base(
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::allreduce(
     std::vector<at::Tensor>& tensors, const AllreduceOptions& opts) {
+  spyre::guard_legacy_collective();
   check_vector_tensor(tensors, 1, 1);
   if (opts.reduceOp != ReduceOp::SUM) {
     std::string _err_msg = "[" + getBackendName() +
@@ -518,6 +532,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::alltoall_base(
 }
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::barrier(const BarrierOptions& opts) {
+  spyre::guard_legacy_collective();
   c10::intrusive_ptr<SpyreCCLWork> work =
       c10::make_intrusive<SpyreCCLWork>(OpType::BARRIER);
   work->work_schedule_ = group_context_->barrier();
@@ -530,6 +545,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::barrier(const BarrierOptions& opts) {
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::broadcast(
     std::vector<at::Tensor>& tensors, const BroadcastOptions& opts) {
+  spyre::guard_legacy_collective();
   check_vector_tensor(tensors, 1, 1);
   c10::intrusive_ptr<SpyreCCLWork> work =
       c10::make_intrusive<SpyreCCLWork>(OpType::BROADCAST);
@@ -549,6 +565,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::broadcast(
 c10::intrusive_ptr<Work> SpyreCCLBackend::gather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const GatherOptions& opts) {
+  spyre::guard_legacy_collective();
   if (opts.rootRank == group_context_->getRank()) {
     if (static_cast<int>(outputTensors.size()) != 1) {
       std::string _err_msg =
@@ -594,6 +611,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::gather(
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::reduce(
     std::vector<at::Tensor>& tensors, const ReduceOptions& opts) {
+  spyre::guard_legacy_collective();
   check_vector_tensor(tensors, 1, 1);
   if (opts.reduceOp != ReduceOp::SUM) {
     std::string _err_msg = "[" + getBackendName() +
@@ -640,6 +658,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::scatter(
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::send(std::vector<at::Tensor>& tensors,
                                                int dstRank, int tag) {
+  spyre::guard_legacy_collective();
   // NOTE: The c10d::Backend::send() signature carries no opts struct and
   // therefore exposes no asyncOp flag.  We follow the same non-blocking
   // submission pattern used by all collectives and leave completion control
@@ -658,6 +677,7 @@ c10::intrusive_ptr<Work> SpyreCCLBackend::send(std::vector<at::Tensor>& tensors,
 
 c10::intrusive_ptr<Work> SpyreCCLBackend::recv(std::vector<at::Tensor>& tensors,
                                                int srcRank, int tag) {
+  spyre::guard_legacy_collective();
   // NOTE: The c10d::Backend::recv() signature carries no opts struct and
   // therefore exposes no asyncOp flag.  We follow the same non-blocking
   // submission pattern used by all collectives and leave completion control
@@ -719,6 +739,7 @@ bool SpyreCCLWork::isSuccess() const {
 }
 
 bool SpyreCCLWork::wait(std::chrono::milliseconds timeout) {
+  spyre::ReleaseGilIfHeld release;
   if (!work_schedule_ || completed_) {
     // Already done; resolve the future if it hasn't been yet.
     if (!future_->completed()) {

@@ -155,7 +155,8 @@ class JobPlanBuilder {
 
   std::unordered_map<std::string, HostBuffer> pinned_buffer_map_;
 
-  std::vector<std::string> inits_;
+  std::vector<std::shared_ptr<const std::string>> inits_;
+  std::shared_ptr<const flex::CompositeAddress> allocation_owner_;
 
   /// Execute the job preparation plan (allocate + init transfers)
   void executeJobPreparationPlan();

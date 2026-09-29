@@ -1061,9 +1061,12 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
     }
   }
 
-  stream.copyAsync(*copy_from, *copy_to);
-  if (!non_blocking) {
-    stream.synchronize();
+  if (non_blocking ||
+      !stream.tryInitializationCopy(*copy_from, *copy_to)) {
+    stream.copyAsync(*copy_from, *copy_to);
+    if (!non_blocking) {
+      stream.synchronize();
+    }
   }
 
   if (!non_overlapping_and_dense) {
@@ -1205,7 +1208,7 @@ at::Tensor spyre_fill_tensor(const at::Tensor& self, double value) {
   // Launch a device-side MEMORY_FILL DMA via the typed fillAsync overload.
   SpyreStream stream;
   stream.fillAsync(get_composite_address(self), value, dtype,
-                   /*use_dmai=*/true);
+                   /*use_dmai=*/true, std::make_shared<const at::Tensor>(self));
 
   return self;
 }

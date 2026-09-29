@@ -269,9 +269,10 @@ void JobPlanBuilder::executeAllocate(const nlohmann::json& cmd) {
                                       std::nullopt, flex::MemoryType::Program);
   c10::DataPtr allocated_ptr = allocator.allocate(size, directive);
 
-  job_allocation_.emplace_back(
+  allocation_owner_ = std::make_shared<flex::CompositeAddress>(
       std::move(static_cast<SharedOwnerCtx*>(allocated_ptr.get_context())
                     ->composite_addr));
+  job_allocation_.emplace_back(allocation_owner_->chunks());
 }
 
 void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
@@ -292,7 +293,8 @@ void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
   std::string binary_file = init_props["init_bin_file"].get<std::string>();
   std::filesystem::path binary_path = spyrecode_dir_ / binary_file;
 
-  inits_.emplace_back(read_file_to_string(binary_path));
+  inits_.push_back(
+      std::make_shared<const std::string>(read_file_to_string(binary_path)));
 
   TORCH_CHECK(init_props.contains("dev_ptr"),
               "InitTransfer command missing 'dev_ptr' property");
@@ -309,9 +311,9 @@ void JobPlanBuilder::executeInitTransfer(const nlohmann::json& cmd) {
   job_allocation_.emplace_back(
       compute_offset_address(job_allocation_.at(0), dev_ptr, init_size));
 
-  stream_.copyProgramAsync(
-      const_cast<void*>(static_cast<const void*>(inits_.back().data())),
-      &job_allocation_.back());
+  stream_.copyProgramAsync(const_cast<char*>(inits_.back()->data()),
+                           &job_allocation_.back(),
+                           {inits_.back(), allocation_owner_});
 }
 
 void JobPlanBuilder::executeJobPreparationPlan() {
@@ -721,8 +723,10 @@ std::unique_ptr<JobPlan> JobPlanBuilder::translateJobExecPlan() {
       JobPlan{std::move(steps),            // steps
               std::move(job_allocation_),  // job_allocation
               {},                          // expected_input_shapes
-              std::move(pinned_buffers),   // pinned_buffers
-              std::move(inits_)});
+              std::make_shared<const std::vector<HostBuffer>>(
+                  std::move(pinned_buffers)),
+              std::move(inits_),
+              std::move(allocation_owner_)});
 }
 
 JobPlanBuilder::ValidationResult JobPlanBuilder::validate(

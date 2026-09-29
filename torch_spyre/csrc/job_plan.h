@@ -29,6 +29,7 @@
 #include <variant>
 #include <vector>
 
+#include "distributed/comm_stream.h"
 #include "spyrecode-host-functions/spyrecode.h"
 
 namespace spyre {
@@ -272,6 +273,7 @@ struct LaunchContext {
    * for existing callers that pass no payload.
    */
   std::vector<SymbolicArg> symbolic_args;
+  std::vector<std::shared_ptr<const void>> owners;
 };
 
 /**
@@ -507,14 +509,11 @@ class JobPlanStepCompute final : public JobPlanStep {
 /**
  * @brief Host-side computation step (e.g., program correction)
  *
- * Stores compiler metadata (Hcm) and the destination device address for the
- * correction blob.  construct() builds a producer lambda (one of four cases
- * depending on input source), calls it to allocate + fill a RaiiBuffer, then
- * launches the correction H2D — both produce and transfer happen in one step,
- * retiring the shared output_buffer_ pin.
- *
- * The RaiiBuffer produced at launch time carries the correction bytes; the
- * adjacent DataTransfer H2D is collapsed into this step by the builder.
+ * Keeps a prepared Flex HostComputeHandle and the correction destination.
+ * construct() passes symbolic address arguments to Flex, which produces fresh
+ * staging bytes and launches their H2D in the same step. The completion callback
+ * retains launch owners through that DMA; Flex retains its own staging buffer.
+ * The adjacent DataTransfer H2D is collapsed into this step by the builder.
  */
 class JobPlanStepHostCompute final : public JobPlanStep {
  public:
@@ -538,9 +537,12 @@ class JobPlanStepHostCompute final : public JobPlanStep {
         device_address_(std::move(device_address)),
         input_buffer_(input_buffer),
         ishape_(std::move(ishape)) {
-    pipeline_barrier_ = false;  // host-compute is overlap-eligible
-    // Create the host compute handle at construction time.
-    // This will internally create the fast_plan for deeptools.
+    pipeline_barrier_ = false;  // preserve the default execution mode
+    if (comm_stream_enabled()) {
+      pipeline_barrier_ = true;
+      role_ = StreamRole::Prep;
+    }
+    // Flex owns the Hcm and its prepared fast-patch plan.
     handle_ = flex::createHostComputeHandle(std::move(hcm));
   }
 
@@ -628,14 +630,17 @@ struct JobPlan {
    *
    */
   // TODO(jni): not safe for multi streams. Make it per-stream. See #2520.
-  std::vector<HostBuffer> pinned_buffers;
+  std::shared_ptr<const std::vector<HostBuffer>> pinned_buffers;
 
   /**
    * @brief Compiled programs
    *
    * One entry per program.
    */
-  std::vector<std::string> inits;
+  std::vector<std::shared_ptr<const std::string>> inits;
+
+  // Actual allocator owner; the job_allocation entries are non-owning views.
+  std::shared_ptr<const flex::CompositeAddress> allocation_owner;
 };
 
 /**

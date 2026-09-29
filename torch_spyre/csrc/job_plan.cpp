@@ -28,12 +28,13 @@
 
 namespace spyre {
 
-void JobPlanStepH2D::construct(LaunchContext&,
+void JobPlanStepH2D::construct(LaunchContext& ctx,
                                const SpyreStream& stream) const {
   auto* params =
       flex::createDmaParams(host_address_, device_address_.total_size(),
                             /*to_device=*/true, &device_address_);
   params->pipeline_barrier = pipeline_barrier_;
+  retainOperationOwners(params->callback, ctx.owners);
   stream.launchH2D(params);
   flex::destroyDmaParams(params);
 }
@@ -55,6 +56,7 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
         flex::createDmaParams(host_address_, device_address.total_size(),
                               /*to_device=*/false, &device_address);
     params->pipeline_barrier = pipeline_barrier_;
+    retainOperationOwners(params->callback, ctx.owners);
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   } else {
@@ -87,6 +89,7 @@ void JobPlanStepD2H::construct(LaunchContext& ctx,
                               /*to_device=*/false, device_address.get());
     params->pipeline_barrier = pipeline_barrier_;
     params->callback = [device_address](void*) {};
+    retainOperationOwners(params->callback, ctx.owners);
     stream.launchD2H(params);
     flex::destroyDmaParams(params);
   }
@@ -116,6 +119,7 @@ void JobPlanStepCompute::construct(LaunchContext& ctx,
   auto* params = flex::createComputeParams(
       &program_address_, std::move(tensor_allocs), name_, bootstrap_offset_);
   params->pipeline_barrier = pipeline_barrier_;
+  retainOperationOwners(params->callback, ctx.owners);
   stream.launchCompute(params);
   flex::destroyComputeParams(params);
 }
@@ -167,6 +171,7 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
     }
   } guard{params};
 
+  retainOperationOwners(params->callback, ctx.owners);
   stream.launchHostCompute(params);
 }
 
@@ -208,9 +213,11 @@ std::ostream& operator<<(std::ostream& os, const JobPlan& plan) {
   }
 
   // Pinned buffers
-  os << "Pinned buffers: " << plan.pinned_buffers.size() << "\n";
-  for (size_t i = 0; i < plan.pinned_buffers.size(); ++i) {
-    const auto& buf = plan.pinned_buffers[i];
+  os << "Pinned buffers: "
+     << (plan.pinned_buffers ? plan.pinned_buffers->size() : 0) << "\n";
+  for (size_t i = 0;
+       i < (plan.pinned_buffers ? plan.pinned_buffers->size() : 0); ++i) {
+    const auto& buf = (*plan.pinned_buffers)[i];
     os << "  Buffer " << i << ": ptr=" << buf.data() << ", size=" << buf.size()
        << " bytes\n";
   }

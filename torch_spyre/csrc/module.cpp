@@ -35,6 +35,7 @@
 #include <string>
 #include <vector>
 
+#include "distributed/comm_stream.h"
 #include "job_plan.h"
 #include "kernel_provenance_registry.h"
 
@@ -94,6 +95,14 @@ bool get_hazard_tracker_enabled() {
   return g_hazard_tracker_enabled.load(std::memory_order_relaxed);
 }
 
+bool comm_stream_enabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("TORCH_SPYRE_COMM_STREAM");
+    return value && std::string(value) == "1";
+  }();
+  return enabled;
+}
+
 // Optional: initialize from env at module init
 static void init_from_env() {
   if (const char* v = std::getenv(SPYRE_DOWNCAST_ENV)) {
@@ -106,6 +115,7 @@ static void init_from_env() {
   // SPYRE_HAZARD_TRACKER: match flex's BooleanEnvVar grammar exactly, since
   // flex reads the same var. On = {"1","true","t","yes","y"} (case-sensitive);
   // anything else is off. Defaults OFF when unset.
+  g_hazard_tracker_enabled.store(false, std::memory_order_relaxed);
   if (const char* v = std::getenv("SPYRE_HAZARD_TRACKER")) {
     const std::string s(v);
     const bool enable =
@@ -116,6 +126,18 @@ static void init_from_env() {
 
 void _startRuntime() {
   SPYRE_RUNTIME_DEBUG() << "starting runtime";
+  init_from_env();
+  if (comm_stream_enabled()) {
+#ifndef USE_SPYRE_CCL
+    TORCH_CHECK(false, "TORCH_SPYRE_COMM_STREAM requires Spyre CCL support");
+#endif
+    TORCH_CHECK(get_hazard_tracker_enabled(),
+                "TORCH_SPYRE_COMM_STREAM requires SPYRE_HAZARD_TRACKER=1");
+    const char* sync = std::getenv("FORCE_SYNCHRONOUS_EXECUTION");
+    TORCH_CHECK(
+        sync && std::string(sync) == "NONE",
+        "TORCH_SPYRE_COMM_STREAM requires FORCE_SYNCHRONOUS_EXECUTION=NONE");
+  }
   // Determine logical device index with priority:
   //   1. tls_idx (non-zero) — set via explicit set_device() call
   //   2. LOCAL_RANK env var — set by torchrun per process
@@ -149,7 +171,6 @@ void _startRuntime() {
   // create() never returns null: it returns the singleton or throws.
   flex::RuntimeContext* runtime =
       flex::RuntimeContext::create(logical_device_id);
-  init_from_env();
   GlobalRuntime::set(runtime);
   // SPYRE_HAZARD_TRACKER (read in init_from_env) is latched per stream at
   // creation via track_hazards; nothing to toggle on the runtime here.
@@ -591,7 +612,9 @@ PYBIND11_MODULE(_C, m) {
                std::to_string(plan.job_allocation.at(0).total_size()) +
                " expected_inputs=" +
                std::to_string(plan.expected_input_shapes.size()) +
-               " pinned_buffers=" + std::to_string(plan.pinned_buffers.size()) +
+               " pinned_buffers=" +
+               std::to_string(
+                   (plan.pinned_buffers ? plan.pinned_buffers->size() : 0)) +
                ">";
       });
   // Symbolic argument payload types

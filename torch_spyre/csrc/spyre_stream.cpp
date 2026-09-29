@@ -20,6 +20,8 @@
 #include <c10/core/Device.h>
 #include <c10/core/Stream.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -29,6 +31,7 @@
 #include <utility>
 #include <vector>
 
+#include "distributed/comm_stream.h"
 #include "flex/flex.hpp"
 #include "job_plan.h"
 #include "logging.h"
@@ -36,12 +39,38 @@
 #include "spyre_allocator.h"
 #include "spyre_composite_address.h"
 #include "spyre_error.h"
+#include "spyre_gil.h"
 #include "spyre_guard.h"
 #include "spyre_mem.h"
 #include "spyre_tensor_impl.h"
 
 namespace spyre {
 namespace {
+template <typename F>
+auto comm_stream_boundary(F&& operation) -> decltype(operation()) {
+  if (!comm_stream_enabled()) return operation();
+  rethrow_comm_stream_failure();
+  ReleaseGilIfHeld release;
+  try {
+    return operation();
+  }
+  catch (...) {
+    record_comm_stream_failure(std::current_exception());
+    throw;
+  }
+}
+
+struct OperationOwners {
+  std::vector<std::shared_ptr<const void>> owners;
+  flex::Runtime_operation_cb_t previous;
+  std::atomic<bool> complete{false};
+};
+auto& operationOwners() {
+  // Failed/abandoned operations remain rooted until process exit. Callbacks
+  // only mark success; only the validated caller reaps and releases owners.
+  static auto* records = new std::vector<std::shared_ptr<OperationOwners>>;
+  return *records;
+}
 
 // TODO(tmhoangt): torch-spyre manages the pool and mapping; flex runtime just
 // creates/destroys individual streams when asked.
@@ -90,6 +119,60 @@ thread_local std::unordered_map<c10::DeviceIndex, c10::StreamId>
     current_streams;
 
 }  // anonymous namespace
+
+void reapOperationOwners() {
+  if (!comm_stream_enabled()) return;
+  auto& records = operationOwners();
+  records.erase(
+      std::remove_if(records.begin(), records.end(),
+                     [](const auto& r) {
+                       if (!r->complete.load(std::memory_order_acquire))
+                         return false;
+                       // Callback has stopped accessing these fields. Release
+                       // Python-linked owners on the validated caller thread.
+                       r->owners.clear();
+                       r->previous = {};
+                       return true;
+                     }),
+      records.end());
+}
+
+void retainOperationOwners(flex::Runtime_operation_cb_t& callback,
+                           std::vector<std::shared_ptr<const void>> owners) {
+  if (!comm_stream_enabled()) return;
+  rethrow_comm_stream_failure();
+  reapOperationOwners();
+  auto& records = operationOwners();
+  // Bound bookkeeping, not payload bytes: backing allocation sizes depend on
+  // the workload. Drain before registering the next submission.
+  if (records.size() >= 4096) synchronizeDevice(c10::nullopt);
+  TORCH_CHECK(records.size() < 4096, "Operation owner drain did not complete");
+  auto record = std::make_shared<OperationOwners>();
+  record->owners = std::move(owners);
+  record->previous = std::move(callback);
+  records.push_back(record);
+  callback = [record](void* data) {
+    if (record->previous) record->previous(data);
+    record->complete.store(true, std::memory_order_release);
+  };
+}
+
+void synchronizePrepStreams(c10::Device device) {
+  std::vector<flex::RuntimeStream*> handles;
+  auto& pool = getStreamPool();
+  {
+    std::shared_lock<std::shared_mutex> lock(pool.mutex);
+    auto it = pool.host_compute_streams.find(device.index());
+    if (it != pool.host_compute_streams.end()) {
+      for (auto sid : it->second)
+        handles.push_back(pool.stream_handle_map.at(sid));
+    }
+  }
+  for (auto* handle : handles) {
+    handle->synchronize();
+    TORCH_CHECK(!handle->needsShutdown(), "Cannot reuse a failed Prep stream");
+  }
+}
 
 // Stream pool configuration
 // Per device:
@@ -145,23 +228,42 @@ int SpyreStream::priority() const {
 }
 
 bool SpyreStream::query() const {
-  c10::DeviceGuard guard(stream_.device());
+  validate_comm_stream_caller(device(), id());
+  return comm_stream_boundary([&] {
+    c10::DeviceGuard guard(stream_.device());
 
-  SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
-                        << static_cast<int>(device().index());
+    SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
+                          << static_cast<int>(device().index());
 
-  flex::RuntimeStream* handle = resolveRuntimeHandle();
-  return handle->query();
+    flex::RuntimeStream* handle = resolveRuntimeHandle();
+    const bool complete = handle->query();
+    if (comm_stream_enabled()) {
+      if (auto error = handle->peekDeferredError())
+        std::rethrow_exception(error);
+      TORCH_CHECK(!handle->needsShutdown(), "Cannot reuse a failed Dev stream");
+      reapOperationOwners();
+    }
+    return complete;
+  });
 }
 
 void SpyreStream::synchronize() const {
-  RECORD_FUNCTION("host::synchronize", {});
-  c10::DeviceGuard device_guard(stream_.device());
+  validate_comm_stream_caller(device(), id());
+  return comm_stream_boundary([&] {
+    RECORD_FUNCTION("host::synchronize", {});
+    c10::DeviceGuard device_guard(stream_.device());
 
-  SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
-                        << static_cast<int>(device().index());
+    SPYRE_RUNTIME_DEBUG() << "stream " << id() << " on device "
+                          << static_cast<int>(device().index());
 
-  resolveRuntimeHandle()->synchronize();
+    auto* handle = resolveRuntimeHandle();
+    if (!synchronize_comm_and_dev(device(), handle)) handle->synchronize();
+    if (comm_stream_enabled()) {
+      synchronizePrepStreams(device());
+      TORCH_CHECK(!handle->needsShutdown(), "Cannot reuse a failed Dev stream");
+      reapOperationOwners();
+    }
+  });
 }
 
 c10::Stream SpyreStream::unwrap() const {
@@ -169,14 +271,45 @@ c10::Stream SpyreStream::unwrap() const {
 }
 
 void SpyreStream::copyProgramAsync(
-    void* prog_cpu_ptr, const flex::CompositeAddress* device_address) const {
+    void* prog_cpu_ptr, const flex::CompositeAddress* device_address,
+    std::vector<std::shared_ptr<const void>> owners) const {
   // NOTE: the assumption is that the size of the program match the size of
   // device_address
-  copyAsyncImpl(prog_cpu_ptr, device_address, nullptr, true);
+  validate_comm_stream_caller(device(), id(), true);
+  copyAsyncImpl(prog_cpu_ptr, device_address, nullptr, true, std::move(owners));
+}
+
+bool SpyreStream::tryInitializationCopy(const at::Tensor& src,
+                                       const at::Tensor& dst) const {
+  if (!comm_stream_enabled() || !src.is_cpu() || !dst.is_privateuseone())
+    return false;
+  return run_initialization_copy(
+      device(), id(),
+      [&] {
+        c10::DeviceGuard guard(device());
+        const auto stl = get_spyre_tensor_layout(dst);
+        auto dci = std::make_shared<data_conversion_info>(
+            generate_dci(&src, &dst, stl, true));
+        const auto* address = get_composite_address(dst);
+        std::unique_ptr<flex::DmaParams, decltype(&flex::destroyDmaParams)>
+            params(flex::createDmaParams(
+                       const_cast<void*>(src.storage().data()),
+                       address->total_size(), true, address, std::move(dci)),
+                   &flex::destroyDmaParams);
+        params->pipeline_barrier = true;
+        auto* handle = resolveRuntimeHandle();
+        handle->launchOperationH2D(params.get());
+        handle->synchronize();
+        TORCH_CHECK(!handle->needsShutdown(),
+                    "Cannot reuse a failed initialization DMA stream");
+      },
+      {std::make_shared<const std::vector<at::Tensor>>(
+          std::vector<at::Tensor>{src, dst})});
 }
 
 void SpyreStream::copyAsync(const at::Tensor& src,
                             const at::Tensor& dst) const {
+  validate_comm_stream_caller(device(), id(), true);
   SPYRE_RUNTIME_DEBUG() << "src (" << src.scalar_type()
                         << ") is on:" << src.device();
   SPYRE_RUNTIME_DEBUG() << "dst (" << dst.scalar_type()
@@ -200,7 +333,9 @@ void SpyreStream::copyAsync(const at::Tensor& src,
         generate_dci(cpu_tensor, dev_tensor, stl, host2device);
 
     copyAsyncImpl(cpu_ptr, get_composite_address(*dev_tensor), &dci,
-                  host2device);
+                  host2device,
+                  {std::make_shared<const std::vector<at::Tensor>>(
+                      std::vector<at::Tensor>{src, dst})});
 
   } else {
     TORCH_CHECK(false, "Unsupported copy types: src on ", src.device(),
@@ -224,10 +359,10 @@ SpyreStreamError SpyreStream::getError() const {
                                                  : SpyreStreamError::Success;
 }
 
-void SpyreStream::copyAsyncImpl(void* cpu_ptr,
-                                const flex::CompositeAddress* device_address,
-                                const DataConversionInfo* dci,
-                                bool host2device) const {
+void SpyreStream::copyAsyncImpl(
+    void* cpu_ptr, const flex::CompositeAddress* device_address,
+    const DataConversionInfo* dci, bool host2device,
+    std::vector<std::shared_ptr<const void>> owners) const {
   // Wrap dci in shared_ptr for flex API
   auto dci_ptr = dci ? std::make_shared<data_conversion_info>(*dci) : nullptr;
 
@@ -236,83 +371,121 @@ void SpyreStream::copyAsyncImpl(void* cpu_ptr,
     auto* params =
         flex::createDmaParams(cpu_ptr, device_address->total_size(),
                               host2device, device_address, std::move(dci_ptr));
+    if (comm_stream_enabled()) params->pipeline_barrier = true;
+    retainOperationOwners(params->callback, std::move(owners));
     launchH2D(params);
     flex::destroyDmaParams(params);
   } else {
     auto* params =
         flex::createDmaParams(cpu_ptr, device_address->total_size(),
                               host2device, device_address, std::move(dci_ptr));
+    if (comm_stream_enabled()) params->pipeline_barrier = true;
+    retainOperationOwners(params->callback, std::move(owners));
     launchD2H(params);
     flex::destroyDmaParams(params);
   }
 }
 
 void SpyreStream::launchH2D(flex::DmaParams* params) const {
-  RECORD_FUNCTION("launch::H2D", {});
-  resolveRuntimeHandle()->launchOperationH2D(params);
+  return comm_stream_boundary([&] {
+    RECORD_FUNCTION("launch::H2D", {});
+    resolveRuntimeHandle()->launchOperationH2D(params);
+  });
 }
 
 void SpyreStream::launchD2H(flex::DmaParams* params) const {
-  RECORD_FUNCTION("launch::D2H", {});
-  resolveRuntimeHandle()->launchOperationD2H(params);
+  return comm_stream_boundary([&] {
+    RECORD_FUNCTION("launch::D2H", {});
+    resolveRuntimeHandle()->launchOperationD2H(params);
+  });
 }
 
 void SpyreStream::launchCompute(flex::ComputeParams* params) const {
-  RECORD_FUNCTION("launch::Compute", {});
-  resolveRuntimeHandle()->launchOperationCompute(params);
+  return comm_stream_boundary([&] {
+    RECORD_FUNCTION("launch::Compute", {});
+    resolveRuntimeHandle()->launchOperationCompute(params);
+  });
 }
 
 void SpyreStream::launchHostCallback(flex::HostCallbackParams* params) const {
-  RECORD_FUNCTION("launch::HostCallback", {});
-  resolveRuntimeHandle()->launchOperationHostCallback(params);
+  return comm_stream_boundary([&] {
+    RECORD_FUNCTION("launch::HostCallback", {});
+    resolveRuntimeHandle()->launchOperationHostCallback(params);
+  });
 }
 
 void SpyreStream::fillAsync(const flex::CompositeAddress* dst, double value,
-                            DataFormats dtype, bool use_dmai) const {
-  RECORD_FUNCTION("launch::Memset", {});
-  resolveRuntimeHandle()->fillAsync(dst, value, dtype, use_dmai);
+                            DataFormats dtype, bool use_dmai,
+                            std::shared_ptr<const void> owner) const {
+  validate_comm_stream_caller(device(), id(), true);
+  return comm_stream_boundary([&] {
+    RECORD_FUNCTION("launch::Memset", {});
+    auto* handle = resolveRuntimeHandle();
+    flex::Runtime_operation_cb_t completed;
+    retainOperationOwners(completed, {std::move(owner)});
+    handle->fillAsync(dst, value, dtype, use_dmai);
+    if (comm_stream_enabled()) {
+      handle->synchronize();
+      TORCH_CHECK(!handle->needsShutdown(),
+                  "Cannot reuse a failed fill stream");
+      completed(nullptr);
+      reapOperationOwners();
+    }
+  });
 }
 
 void SpyreStream::launchHostCompute(flex::HostComputeParams* params) const {
-  RECORD_FUNCTION("launch::HostCompute", {});
-  resolveRuntimeHandle()->launchHostCompute(params);
+  return comm_stream_boundary([&] {
+    RECORD_FUNCTION("launch::HostCompute", {});
+    resolveRuntimeHandle()->launchHostCompute(params);
+  });
 }
 
 void SpyreStream::launch(const JobPlan& plan,
                          const std::vector<at::Tensor>& args,
                          std::vector<SymbolicArg> symbolic_args) const {
-  // Validate all tensors are on Spyre device
-  for (size_t i = 0; i < args.size(); ++i) {
-    TORCH_CHECK(args[i].is_privateuseone(), "SpyreStream::launch: argument ", i,
-                " must be on Spyre device, got ", args[i].device());
-  }
+  validate_comm_stream_caller(device(), id(), true);
+  return comm_stream_boundary([&] {
+    // Validate all tensors are on Spyre device
+    for (size_t i = 0; i < args.size(); ++i) {
+      TORCH_CHECK(args[i].is_privateuseone(), "SpyreStream::launch: argument ",
+                  i, " must be on Spyre device, got ", args[i].device());
+    }
 
-  // Two-stream overlap topology:
-  //   S_dev  = this stream (the default) — Compute (+ D2H).
-  //   S_prep = the persistent host-compute stream — HostCompute + H2D.
-  // Compute overlaps HC/H2D because they run on different streams; every op
-  // keeps pipeline_barrier=true (per-stream FIFO). S_prep must be the same
-  // persistent flex handle each launch: getHostComputeStreamById is a pure
-  // lookup of the handle registered once in initializeStreamPoolImpl.
-  const SpyreStream& s_dev = *this;
-  const SpyreStream s_prep =
-      getHostComputeStreamById(kHostComputeStreamStartPerDevice, device());
+    // Two-stream overlap topology:
+    //   S_dev  = this stream (the default) — Compute (+ D2H).
+    //   S_prep = the persistent host-compute stream — HostCompute + H2D.
+    // Compute overlaps HC/H2D because they run on different streams; every op
+    // keeps pipeline_barrier=true (per-stream FIFO). S_prep must be the same
+    // persistent flex handle each launch: getHostComputeStreamById is a pure
+    // lookup of the handle registered once in initializeStreamPoolImpl.
+    const SpyreStream& s_dev = *this;
+    const SpyreStream s_prep =
+        getHostComputeStreamById(kHostComputeStreamStartPerDevice, device());
 
-  // Create launch context with tensor arguments and typed symbolic payload.
-  // symbolic_args is moved in so the closure in
-  // JobPlanStepHostCompute::construct can capture it by value without an extra
-  // copy.
-  LaunchContext ctx{args, std::move(symbolic_args)};
+    // Create launch context with tensor arguments and typed symbolic payload.
+    // symbolic_args is moved in so the closure in
+    // JobPlanStepHostCompute::construct can capture it by value without an
+    // extra copy.
+    LaunchContext ctx{args,
+                      std::move(symbolic_args),
+                      {plan.allocation_owner, plan.pinned_buffers,
+                       std::make_shared<const std::vector<at::Tensor>>(args)}};
 
-  // Split Prep-role steps onto S_prep only when the flex tracker is on; flex
-  // then inserts the cross-stream edges. Off = every step on S_dev (the
-  // single-stream floor). Routing keys on role(), so all-Dev plans never split.
-  const bool should_split = get_hazard_tracker_enabled();
-  for (const auto& step : plan.steps) {
-    const SpyreStream& target =
-        (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
-    step->construct(ctx, target);
-  }
+    // Split Prep-role steps onto S_prep only when the flex tracker is on; flex
+    // then inserts the cross-stream edges. Off = every step on S_dev (the
+    // single-stream floor). Routing keys on role(), so all-Dev plans never
+    // split.
+    const bool should_split = get_hazard_tracker_enabled();
+    for (const auto& step : plan.steps) {
+      const SpyreStream& target =
+          (should_split && step->role() == StreamRole::Prep) ? s_prep : s_dev;
+      SPYRE_RUNTIME_DEBUG()
+          << "overlap step=" << stepKindName(classifyStep(*step))
+          << " stream=" << target.id();
+      step->construct(ctx, target);
+    }
+  });
 }
 
 void initializeStreamPoolImpl(c10::DeviceIndex device_index) {
@@ -514,49 +687,64 @@ SpyreStream getStreamFromPool(c10::Device device, int priority) {
 }
 
 void synchronizeDevice(c10::optional<c10::Device> device) {
-  auto sync_one_device = [](c10::Device dev) {
-    if (dev.index() == -1) {
-      dev = c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
-    }
-    const auto device_index = dev.index();
-
-    std::vector<flex::RuntimeStream*> handles_to_sync;
-    {
-      auto& pool = getStreamPool();
-      std::shared_lock<std::shared_mutex> lock(pool.mutex);
-
-      // Default stream (ID 0) is always present when the pool is initialized
-      auto default_it = pool.stream_handle_map.find(0);
-      if (default_it != pool.stream_handle_map.end()) {
-        handles_to_sync.push_back(default_it->second);
+  c10::Device requested = device.value_or(
+      c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx));
+  if (requested.index() < 0)
+    requested =
+        c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
+  validate_comm_stream_caller(requested, 0);
+  return comm_stream_boundary([&] {
+    auto sync_one_device = [](c10::Device dev) {
+      if (dev.index() == -1) {
+        dev =
+            c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx);
       }
+      const auto device_index = dev.index();
 
-      auto collect = [&](auto& stream_map) {
-        auto it = stream_map.find(device_index);
-        if (it == stream_map.end()) return;
-        for (auto sid : it->second) {
-          auto h = pool.stream_handle_map.find(sid);
-          if (h != pool.stream_handle_map.end()) {
-            handles_to_sync.push_back(h->second);
-          }
+      std::vector<flex::RuntimeStream*> handles_to_sync;
+      {
+        auto& pool = getStreamPool();
+        std::shared_lock<std::shared_mutex> lock(pool.mutex);
+
+        // Default stream (ID 0) is always present when the pool is initialized
+        auto default_it = pool.stream_handle_map.find(0);
+        if (default_it != pool.stream_handle_map.end()) {
+          handles_to_sync.push_back(default_it->second);
         }
-      };
-      collect(pool.low_priority_streams);
-      collect(pool.high_priority_streams);
-      collect(pool.host_compute_streams);
-    }  // lock released
 
-    c10::DeviceGuard guard(dev);
-    for (auto handle : handles_to_sync) {
-      handle->synchronize();
+        auto collect = [&](auto& stream_map) {
+          auto it = stream_map.find(device_index);
+          if (it == stream_map.end()) return;
+          for (auto sid : it->second) {
+            auto h = pool.stream_handle_map.find(sid);
+            if (h != pool.stream_handle_map.end()) {
+              handles_to_sync.push_back(h->second);
+            }
+          }
+        };
+        collect(pool.low_priority_streams);
+        collect(pool.high_priority_streams);
+        collect(pool.host_compute_streams);
+      }  // lock released
+
+      c10::DeviceGuard guard(dev);
+      if (comm_stream_enabled())
+        synchronize_comm_and_dev(dev, getDefaultStreamRuntimeHandle());
+      for (auto handle : handles_to_sync) {
+        handle->synchronize();
+        if (comm_stream_enabled())
+          TORCH_CHECK(!handle->needsShutdown(),
+                      "Cannot reuse a failed runtime stream");
+      }
+      reapOperationOwners();
+    };
+    if (device.has_value()) {
+      sync_one_device(device.value());
+    } else {
+      sync_one_device(
+          c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx));
     }
-  };
-  if (device.has_value()) {
-    sync_one_device(device.value());
-  } else {
-    sync_one_device(
-        c10::Device(c10::DeviceType::PrivateUse1, SpyreGuardImpl::tls_idx));
-  }
+  });
 }
 
 const char* SpyreStreamGetErrorString(SpyreStreamError error) noexcept {
